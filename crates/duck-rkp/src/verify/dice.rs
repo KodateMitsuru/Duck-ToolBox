@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    ANDROID_DICE_PROFILE_VERSION, DICE_PROFILE_NAME,
+    ANDROID_DICE_PROFILE_VERSIONS, DEFAULT_DICE_PROFILE_VERSION, DICE_PROFILE_NAME,
     checks::{ensure_unique_integer_keys, required_int_bytes, required_int_text},
     cose_key::{
         CosePublicKeyInfo, parse_cose_public_key, parse_cose_sign1, verify_signed_data_signature,
@@ -17,15 +17,16 @@ use super::{
 };
 
 /// Open DICE payload fields that must be non-empty byte strings when present.
-const OPTIONAL_DICE_BYTE_FIELDS: [(i128, &str); 6] = [
+const OPTIONAL_DICE_BYTE_FIELDS: [(i128, &str); 5] = [
     (-4_670_545, "code hash"),
     (-4_670_546, "code descriptor"),
     (-4_670_547, "configuration hash"),
     (-4_670_549, "authority hash"),
     (-4_670_550, "authority descriptor"),
-    (-4_670_551, "mode"),
 ];
 const DICE_CONFIGURATION_DESCRIPTOR: i128 = -4_670_548;
+/// `mode` is checked separately: the Android Profile for DICE also permits a CBOR integer.
+const DICE_MODE: i128 = -4_670_551;
 
 pub(super) fn extract_uds_key(dice_chain: &[Value]) -> Result<CosePublicKeyInfo> {
     let uds_key = dice_chain
@@ -98,14 +99,18 @@ fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<CosePublicKeyI
         return Err(anyhow!("{label} subject must not be empty"));
     }
 
-    if let Some(profile_name) = map_get(payload_entries, DICE_PROFILE_NAME) {
-        let profile_name = as_text(profile_name, &format!("{label} profile name"))?;
-        if profile_name != ANDROID_DICE_PROFILE_VERSION {
-            return Err(anyhow!(
-                "{label} profile name must be `{ANDROID_DICE_PROFILE_VERSION}`, got `{profile_name}`"
-            ));
+    let profile_name = match map_get(payload_entries, DICE_PROFILE_NAME) {
+        Some(value) => {
+            let profile_name = as_text(value, &format!("{label} profile name"))?;
+            if !ANDROID_DICE_PROFILE_VERSIONS.contains(&profile_name) {
+                return Err(anyhow!(
+                    "{label} profile name must be one of {ANDROID_DICE_PROFILE_VERSIONS:?}, got `{profile_name}`"
+                ));
+            }
+            Some(profile_name)
         }
-    }
+        None => None,
+    };
 
     if required_int_bytes(payload_entries, DICE_KEY_USAGE, label, "key usage")?.is_empty() {
         return Err(anyhow!("{label} key usage must not be empty"));
@@ -120,6 +125,8 @@ fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<CosePublicKeyI
             ));
         }
     }
+
+    validate_dice_mode(payload_entries, label, profile_name)?;
 
     if let Some(configuration) = map_get(payload_entries, DICE_CONFIGURATION_DESCRIPTOR) {
         let descriptor_label = format!("{label} configuration descriptor");
@@ -138,4 +145,106 @@ fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<CosePublicKeyI
         as_map(&subject_key, "DICE chain subject COSE key")?,
         "DICE chain subject COSE key",
     )
+}
+
+/// Validates the optional DICE `mode` field.
+///
+/// The Open Profile for DICE requires a one-byte CBOR byte string. The Android Profile for DICE
+/// (`android.14`, see the profile's "Mode" note) additionally permits the mode to be encoded as a
+/// CBOR integer, which real bootloaders do emit. AOSP's `hwtrust` applies that relaxation to the
+/// `android.14` profile only and treats a certificate without `profileName` as `android.14`, so the
+/// same rule is applied here.
+fn validate_dice_mode(
+    entries: &[(Value, Value)],
+    label: &str,
+    profile_name: Option<&str>,
+) -> Result<()> {
+    let Some(mode) = map_get(entries, DICE_MODE) else {
+        return Ok(());
+    };
+    let mode_label = format!("{label} mode");
+
+    match mode {
+        Value::Bytes(bytes) => {
+            if bytes.len() != 1 {
+                return Err(anyhow!(
+                    "{mode_label} must be a single byte, got {} bytes",
+                    bytes.len()
+                ));
+            }
+            Ok(())
+        }
+        Value::Integer(_) if allows_integer_mode(profile_name) => Ok(()),
+        Value::Integer(_) => Err(anyhow!(
+            "{mode_label} is a CBOR integer, which profile `{}` does not allow; only the Open DICE byte string form is accepted",
+            effective_profile_name(profile_name)
+        )),
+        other => Err(anyhow!(
+            "{mode_label} is neither CBOR bytes nor a CBOR integer: {other:?}"
+        )),
+    }
+}
+
+/// The Android Profile for DICE permits an integer `mode` in `android.14` only.
+fn allows_integer_mode(profile_name: Option<&str>) -> bool {
+    effective_profile_name(profile_name) == "android.14"
+}
+
+/// Profile name actually in force, applying the documented `android.14` default.
+fn effective_profile_name(profile_name: Option<&str>) -> &str {
+    profile_name.unwrap_or(DEFAULT_DICE_PROFILE_VERSION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DICE_MODE, validate_dice_mode};
+    use crate::cbor::{bytes, int, text};
+
+    const LABEL: &str = "DICE chain entry 1";
+
+    #[test]
+    fn accepts_byte_mode() {
+        validate_dice_mode(
+            &[(int(DICE_MODE), bytes(vec![2]))],
+            LABEL,
+            Some("android.15"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn accepts_integer_mode_for_android_14() {
+        validate_dice_mode(&[(int(DICE_MODE), int(2))], LABEL, Some("android.14")).unwrap();
+    }
+
+    #[test]
+    fn accepts_integer_mode_without_profile_name() {
+        validate_dice_mode(&[(int(DICE_MODE), int(2))], LABEL, None).unwrap();
+    }
+
+    #[test]
+    fn rejects_integer_mode_for_android_15() {
+        let error =
+            validate_dice_mode(&[(int(DICE_MODE), int(2))], LABEL, Some("android.15")).unwrap_err();
+        assert!(error.to_string().contains("CBOR integer"), "{error}");
+    }
+
+    #[test]
+    fn rejects_multi_byte_mode() {
+        let error =
+            validate_dice_mode(&[(int(DICE_MODE), bytes(vec![0, 2]))], LABEL, None).unwrap_err();
+        assert!(error.to_string().contains("single byte"), "{error}");
+    }
+
+    #[test]
+    fn rejects_text_mode() {
+        let error =
+            validate_dice_mode(&[(int(DICE_MODE), text("normal"))], LABEL, None).unwrap_err();
+        assert!(error.to_string().contains("neither"), "{error}");
+    }
+
+    #[test]
+    fn missing_mode_is_allowed() {
+        validate_dice_mode(&[], LABEL, Some("android.15")).unwrap();
+    }
 }
