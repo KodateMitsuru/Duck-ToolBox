@@ -25,6 +25,7 @@ const OPTIONAL_DICE_BYTE_FIELDS: [(i128, &str); 5] = [
     (-4_670_550, "authority descriptor"),
 ];
 const DICE_CONFIGURATION_DESCRIPTOR: i128 = -4_670_548;
+const DICE_SECURITY_VERSION: i128 = -70_005;
 /// `mode` is checked separately: the Android Profile for DICE also permits a CBOR integer.
 const DICE_MODE: i128 = -4_670_551;
 
@@ -39,6 +40,7 @@ pub(super) fn verify_dice_chain_and_extract_leaf_key(
     dice_chain: &[Value],
 ) -> Result<CosePublicKeyInfo> {
     let mut signer = extract_uds_key(dice_chain)?;
+    let mut previous_profile_index = None;
 
     for (index, item) in dice_chain.iter().enumerate().skip(1) {
         let label = format!("DICE chain entry {index}");
@@ -48,7 +50,19 @@ pub(super) fn verify_dice_chain_and_extract_leaf_key(
             return Err(anyhow!("{label} signature is invalid"));
         }
 
-        signer = parse_dice_entry_payload(&decode(entry.payload)?, &label)?;
+        let (subject_key, profile_index) =
+            parse_dice_entry_payload(&decode(entry.payload)?, &label)?;
+        if let Some(previous) = previous_profile_index
+            && profile_index < previous
+        {
+            return Err(anyhow!(
+                "{label} profile name `{}` must not precede previous profile `{}`",
+                ANDROID_DICE_PROFILE_VERSIONS[profile_index],
+                ANDROID_DICE_PROFILE_VERSIONS[previous]
+            ));
+        }
+        previous_profile_index = Some(profile_index);
+        signer = subject_key;
     }
 
     Ok(signer)
@@ -87,7 +101,7 @@ pub(super) fn validate_uds_certs(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<CosePublicKeyInfo> {
+fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<(CosePublicKeyInfo, usize)> {
     let payload_label = format!("{label} payload");
     let payload_entries = as_map(value, &payload_label)?;
     ensure_unique_integer_keys(payload_entries, &payload_label)?;
@@ -99,18 +113,18 @@ fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<CosePublicKeyI
         return Err(anyhow!("{label} subject must not be empty"));
     }
 
-    let profile_name = match map_get(payload_entries, DICE_PROFILE_NAME) {
-        Some(value) => {
-            let profile_name = as_text(value, &format!("{label} profile name"))?;
-            if !ANDROID_DICE_PROFILE_VERSIONS.contains(&profile_name) {
-                return Err(anyhow!(
-                    "{label} profile name must be one of {ANDROID_DICE_PROFILE_VERSIONS:?}, got `{profile_name}`"
-                ));
-            }
-            Some(profile_name)
-        }
-        None => None,
-    };
+    let profile_name = map_get(payload_entries, DICE_PROFILE_NAME)
+        .map(|value| as_text(value, &format!("{label} profile name")))
+        .transpose()?;
+    let effective_profile = effective_profile_name(profile_name);
+    let profile_index = ANDROID_DICE_PROFILE_VERSIONS
+        .iter()
+        .position(|profile| *profile == effective_profile)
+        .ok_or_else(|| {
+            anyhow!(
+                "{label} profile name must be one of {ANDROID_DICE_PROFILE_VERSIONS:?}, got `{effective_profile}`"
+            )
+        })?;
 
     if required_int_bytes(payload_entries, DICE_KEY_USAGE, label, "key usage")?.is_empty() {
         return Err(anyhow!("{label} key usage must not be empty"));
@@ -131,7 +145,17 @@ fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<CosePublicKeyI
     if let Some(configuration) = map_get(payload_entries, DICE_CONFIGURATION_DESCRIPTOR) {
         let descriptor_label = format!("{label} configuration descriptor");
         let configuration = decode(as_bytes(configuration, &descriptor_label)?)?;
-        as_map(&configuration, &descriptor_label)?;
+        let entries = as_map(&configuration, &descriptor_label)?;
+        if effective_profile == "android.16" {
+            ensure_unique_integer_keys(entries, &descriptor_label)?;
+            let security_version = map_get(entries, DICE_SECURITY_VERSION)
+                .ok_or_else(|| anyhow!("{descriptor_label} is missing security version"))?;
+            if !matches!(security_version, Value::Integer(value) if i128::from(*value) >= 0) {
+                return Err(anyhow!(
+                    "{descriptor_label} security version must be a CBOR unsigned integer"
+                ));
+            }
+        }
     }
 
     let subject_key_bytes = required_int_bytes(
@@ -145,6 +169,7 @@ fn parse_dice_entry_payload(value: &Value, label: &str) -> Result<CosePublicKeyI
         as_map(&subject_key, "DICE chain subject COSE key")?,
         "DICE chain subject COSE key",
     )
+    .map(|subject_key| (subject_key, profile_index))
 }
 
 /// Validates the optional DICE `mode` field.
