@@ -284,6 +284,16 @@ fn verify_rejects_invalid_dice_modes_and_profiles() {
 }
 
 #[test]
+fn verify_accepts_dice_entries_without_a_mode_field() {
+    // `dice_fields` always sets `mode`; an entry that omits the field entirely must still
+    // verify, for the strict profile as well as the defaulted one.
+    for entry in [vec![], vec![(int(-4_670_554), text("android.15"))]] {
+        let report = verify_csr(&csr_with_dice_fields(&[entry])).unwrap();
+        assert!(report.signature_valid);
+    }
+}
+
+#[test]
 fn verify_rejects_android_16_configuration_without_unsigned_security_version() {
     for configuration in [
         vec![],
